@@ -71,7 +71,7 @@ class Program
         Console.OutputEncoding = Encoding.UTF8;
         Console.CursorVisible = false;
         Console.Clear();
-        Console.CancelKeyPress += (_, _) =>
+        Console.CancelKeyPress += (sender, e) =>
         {
             Console.CursorVisible = true;
             Console.ResetColor();
