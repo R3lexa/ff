@@ -1,337 +1,281 @@
 #!/usr/bin/env python3
 """
-admin_audit.py — выдача/отзыв административных прав и аудит системы (Linux).
+admin_audit_win.py — выдача/отзыв прав администратора и аудит системы (Windows).
 
-Использование (нужен root):
-    sudo python3 admin_audit.py grant  <user> [--nopasswd]
-    sudo python3 admin_audit.py revoke <user>
-    sudo python3 admin_audit.py audit  [--json] [--output report.txt]
+Запуск из PowerShell или cmd, открытого "От имени администратора":
+    python admin_audit_win.py grant  <user>
+    python admin_audit_win.py revoke <user>
+    python admin_audit_win.py audit [--json] [--output report.txt]
 
-Все действия по выдаче/отзыву прав пишутся в /var/log/admin_audit.log.
+Зависимости: только стандартная библиотека Python 3.6+ и встроенный PowerShell.
+Лог действий: admin_audit.log рядом со скриптом.
 """
 
 import argparse
+import ctypes
 import datetime
-import grp
 import json
 import logging
 import os
-import pwd
+import platform
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 
-LOG_FILE = "/var/log/admin_audit.log"
-SUDOERS_D = "/etc/sudoers.d"
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_audit.log")
 
 
 # --------------------------------------------------------------------------- #
-# Общие утилиты
+# Утилиты
 # --------------------------------------------------------------------------- #
 def setup_logging():
-    handlers = [logging.StreamHandler(sys.stdout)]
-    try:
-        handlers.append(logging.FileHandler(LOG_FILE))
-    except OSError:
-        pass
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=handlers,
+        handlers=[logging.StreamHandler(sys.stdout),
+                  logging.FileHandler(LOG_FILE, encoding="utf-8")],
     )
 
 
-def require_root():
-    if os.geteuid() != 0:
-        sys.exit("Ошибка: скрипт нужно запускать от root (sudo).")
-
-
-def run(cmd, timeout=60):
-    """Запуск команды без shell; возвращает (код, stdout, stderr)."""
+def is_admin():
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def require_admin():
+    if platform.system() != "Windows":
+        sys.exit("Этот скрипт только для Windows.")
+    if not is_admin():
+        sys.exit("Ошибка: запустите терминал от имени администратора.")
+
+
+def run(cmd, timeout=90):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           encoding="cp866", errors="replace")
         return p.returncode, p.stdout.strip(), p.stderr.strip()
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, "", str(e)
 
 
-def user_exists(name):
-    try:
-        pwd.getpwnam(name)
-        return True
-    except KeyError:
-        return False
-
-
-def admin_group():
-    """Группа администраторов зависит от дистрибутива: sudo (Debian) или wheel (RHEL)."""
-    for name in ("sudo", "wheel"):
+def ps(script, as_json=False):
+    """Выполнить PowerShell-команду. При as_json возвращает разобранный JSON."""
+    if as_json:
+        script = f"[Console]::OutputEncoding=[Text.Encoding]::UTF8; {script} | ConvertTo-Json -Depth 3 -Compress"
+    code, out, err = run(["powershell", "-NoProfile", "-NonInteractive",
+                          "-ExecutionPolicy", "Bypass", "-Command", script])
+    if code != 0 or not out:
+        return None if as_json else (err or out)
+    if as_json:
         try:
-            grp.getgrnam(name)
-            return name
-        except KeyError:
-            continue
-    return None
+            data = json.loads(out)
+            return data if isinstance(data, list) else [data]
+        except json.JSONDecodeError:
+            return None
+    return out
 
 
 def valid_username(name):
-    return bool(re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", name))
+    # Запрещённые символы в именах Windows-аккаунтов
+    return bool(name) and len(name) <= 20 and not re.search(r'[\\/\[\]:;|=,+*?<>"@]', name)
+
+
+def local_user_exists(name):
+    code, _, _ = run(["net", "user", name])
+    return code == 0
+
+
+def admin_group_name():
+    """Группа администраторов локализована (Administrators / Администраторы) — берём по SID."""
+    out = ps("(Get-LocalGroup -SID 'S-1-5-32-544').Name")
+    return (out or "Administrators").strip()
 
 
 # --------------------------------------------------------------------------- #
-# Выдача / отзыв прав
+# Выдача / отзыв
 # --------------------------------------------------------------------------- #
-def grant(user, nopasswd=False):
-    if not valid_username(user) or not user_exists(user):
-        sys.exit(f"Пользователь '{user}' не найден или имя некорректно.")
-    if user == "root":
-        sys.exit("root уже обладает полными правами.")
-
-    group = admin_group()
-    if not group:
-        sys.exit("Не найдена группа sudo/wheel. Установите sudo.")
-
-    code, _, err = run(["usermod", "-aG", group, user])
+def grant(user):
+    if not valid_username(user) or not local_user_exists(user):
+        sys.exit(f"Локальный пользователь '{user}' не найден или имя некорректно.")
+    group = admin_group_name()
+    code, out, err = run(["net", "localgroup", group, user, "/add"])
     if code != 0:
-        sys.exit(f"Не удалось добавить в группу {group}: {err}")
-    logging.info("Пользователь %s добавлен в группу %s", user, group)
-
-    if nopasswd:
-        logging.warning("Включён NOPASSWD для %s — это снижает безопасность!", user)
-        path = os.path.join(SUDOERS_D, f"90-{user}")
-        content = f"{user} ALL=(ALL) NOPASSWD:ALL\n"
-        # Проверяем синтаксис через visudo ДО установки файла
-        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        code, _, err = run(["visudo", "-cf", tmp_path])
-        if code != 0:
-            os.unlink(tmp_path)
-            sys.exit(f"Ошибка синтаксиса sudoers: {err}")
-        shutil.move(tmp_path, path)
-        os.chmod(path, 0o440)
-        os.chown(path, 0, 0)
-        logging.info("Создан %s", path)
-
-    logging.info("Админ-права выданы: %s (выполнил uid=%s)", user, os.getenv("SUDO_UID", "0"))
+        if "1378" in (out + err):
+            sys.exit(f"{user} уже в группе {group}.")
+        sys.exit(f"Не удалось выдать права: {out} {err}")
+    logging.info("Права администратора выданы: %s (группа %s)", user, group)
 
 
 def revoke(user):
-    if not valid_username(user) or not user_exists(user):
-        sys.exit(f"Пользователь '{user}' не найден или имя некорректно.")
-
-    for group in ("sudo", "wheel", "admin"):
-        try:
-            grp.getgrnam(group)
-        except KeyError:
-            continue
-        if user in grp.getgrnam(group).gr_mem:
-            run(["gpasswd", "-d", user, group])
-            logging.info("Пользователь %s удалён из группы %s", user, group)
-
-    path = os.path.join(SUDOERS_D, f"90-{user}")
-    if os.path.exists(path):
-        os.remove(path)
-        logging.info("Удалён %s", path)
-
-    logging.info("Админ-права отозваны: %s", user)
+    if not valid_username(user) or not local_user_exists(user):
+        sys.exit(f"Локальный пользователь '{user}' не найден или имя некорректно.")
+    group = admin_group_name()
+    code, out, err = run(["net", "localgroup", group, user, "/delete"])
+    if code != 0:
+        sys.exit(f"Не удалось отозвать права: {out} {err}")
+    logging.info("Права администратора отозваны: %s (группа %s)", user, group)
 
 
 # --------------------------------------------------------------------------- #
 # Аудит
 # --------------------------------------------------------------------------- #
-def audit_uid0():
-    return [u.pw_name for u in pwd.getpwall() if u.pw_uid == 0 and u.pw_name != "root"]
+def audit_admins():
+    data = ps("Get-LocalGroupMember -SID 'S-1-5-32-544' | "
+              "Select-Object Name,ObjectClass,PrincipalSource", as_json=True)
+    return [f"{d['Name']} ({d['ObjectClass']}, {d['PrincipalSource']})" for d in data] if data else []
 
 
-def audit_admin_groups():
-    result = {}
-    for g in ("sudo", "wheel", "admin"):
-        try:
-            result[g] = list(grp.getgrnam(g).gr_mem)
-        except KeyError:
-            pass
-    return result
+def audit_users():
+    data = ps("Get-LocalUser | Select-Object Name,Enabled,PasswordRequired,"
+              "@{n='LastLogon';e={if($_.LastLogon){$_.LastLogon.ToString('s')}else{''}}},"
+              "@{n='PwdLastSet';e={if($_.PasswordLastSet){$_.PasswordLastSet.ToString('s')}else{''}}}",
+              as_json=True)
+    res = []
+    for u in data or []:
+        flags = []
+        if u["Enabled"] and not u["PasswordRequired"]:
+            flags.append("ПАРОЛЬ НЕ ТРЕБУЕТСЯ")
+        res.append(f"{u['Name']}: {'вкл' if u['Enabled'] else 'выкл'}, "
+                   f"последний вход={u['LastLogon'] or '—'}, пароль сменён={u['PwdLastSet'] or '—'}"
+                   + (f"  [!] {', '.join(flags)}" if flags else ""))
+    return res
 
 
-def audit_sudoers():
-    """Ищет NOPASSWD и широкие правила в sudoers и sudoers.d."""
-    files = ["/etc/sudoers"]
-    if os.path.isdir(SUDOERS_D):
-        files += [os.path.join(SUDOERS_D, f) for f in sorted(os.listdir(SUDOERS_D))]
-    findings = []
-    for f in files:
-        try:
-            with open(f) as fh:
-                for n, line in enumerate(fh, 1):
-                    s = line.strip()
-                    if s and not s.startswith("#") and "NOPASSWD" in s:
-                        findings.append(f"{f}:{n}: {s}")
-        except OSError:
-            continue
-    return findings
-
-
-def audit_empty_passwords():
-    empty = []
-    try:
-        with open("/etc/shadow") as fh:
-            for line in fh:
-                parts = line.split(":")
-                if len(parts) > 1 and parts[1] == "":
-                    empty.append(parts[0])
-    except OSError:
-        return ["(нет доступа к /etc/shadow)"]
-    return empty
-
-
-def audit_login_shell_users():
-    nologin = ("nologin", "false")
-    return [
-        f"{u.pw_name} (uid={u.pw_uid}, {u.pw_shell})"
-        for u in pwd.getpwall()
-        if u.pw_uid >= 1000 and not u.pw_shell.endswith(nologin)
-    ]
-
-
-def audit_suid(limit=50):
-    code, out, _ = run(
-        ["find", "/usr", "/bin", "/sbin", "/opt", "-xdev", "-perm", "-4000", "-type", "f"],
-        timeout=120,
-    )
-    files = out.splitlines() if code == 0 else []
-    return files[:limit]
-
-
-def audit_world_writable(limit=30):
-    code, out, _ = run(
-        ["find", "/etc", "/usr/bin", "/usr/sbin", "-xdev", "-type", "f", "-perm", "-0002"],
-        timeout=120,
-    )
-    files = out.splitlines() if code == 0 else []
-    return files[:limit]
-
-
-def audit_listening_ports():
-    code, out, _ = run(["ss", "-tulnH"])
-    return out.splitlines() if code == 0 else []
-
-
-def audit_ssh():
-    path = "/etc/ssh/sshd_config"
-    wanted = {"permitrootlogin": "no", "passwordauthentication": "no", "permitemptypasswords": "no"}
-    current, issues = {}, []
-    try:
-        with open(path) as fh:
-            for line in fh:
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    continue
-                k, _, v = s.partition(" ")
-                current[k.lower()] = v.strip().lower()
-    except OSError:
-        return ["sshd_config недоступен"]
-    for k, good in wanted.items():
-        val = current.get(k)
-        if val != good:
-            issues.append(f"{k} = {val or 'не задано (по умолчанию)'} (рекомендуется: {good})")
-    return issues
-
-
-def audit_last_logins():
-    _, out, _ = run(["last", "-n", "10", "-w"])
+def audit_password_policy():
+    _, out, _ = run(["net", "accounts"])
     return out.splitlines()
 
 
+def audit_firewall():
+    data = ps("Get-NetFirewallProfile | Select-Object Name,Enabled", as_json=True)
+    return [f"{d['Name']}: {'включён' if d['Enabled'] in (True, 1) else 'ВЫКЛЮЧЕН [!]'}"
+            for d in data] if data else ["(не удалось получить)"]
+
+
+def audit_defender():
+    data = ps("Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,"
+              "@{n='Sig';e={$_.AntivirusSignatureLastUpdated.ToString('s')}}", as_json=True)
+    if not data:
+        return ["Defender недоступен (возможно, стоит сторонний антивирус)"]
+    d = data[0]
+    return [f"Антивирус: {'вкл' if d['AntivirusEnabled'] else 'ВЫКЛ [!]'}",
+            f"Защита в реальном времени: {'вкл' if d['RealTimeProtectionEnabled'] else 'ВЫКЛ [!]'}",
+            f"Базы обновлены: {d['Sig']}"]
+
+
+def audit_uac():
+    out = ps("(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System')"
+             ".EnableLUA")
+    return ["UAC включён" if out.strip() == "1" else "UAC ВЫКЛЮЧЕН [!]"]
+
+
+def audit_rdp():
+    out = ps("(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server')"
+             ".fDenyTSConnections")
+    return ["RDP выключен" if out.strip() == "1" else "RDP ВКЛЮЧЁН [!] (проверьте, что он нужен)"]
+
+
+def audit_smb1():
+    out = ps("(Get-SmbServerConfiguration).EnableSMB1Protocol")
+    return ["SMBv1 ВКЛЮЧЁН [!] (устаревший, уязвимый протокол)" if out.strip().lower() == "true"
+            else "SMBv1 выключен"]
+
+
+def audit_bitlocker():
+    data = ps("Get-BitLockerVolume | Select-Object MountPoint,ProtectionStatus", as_json=True)
+    return [f"{d['MountPoint']}: {'защищён' if d['ProtectionStatus'] in (1, 'On') else 'не защищён'}"
+            for d in data] if data else ["(BitLocker недоступен)"]
+
+
+def audit_listening_ports():
+    data = ps("Get-NetTCPConnection -State Listen | Select-Object LocalAddress,LocalPort,OwningProcess "
+              "| Sort-Object LocalPort", as_json=True)
+    names = {}
+    procs = ps("Get-Process | Select-Object Id,ProcessName", as_json=True) or []
+    for p in procs:
+        names[p["Id"]] = p["ProcessName"]
+    return [f"{d['LocalAddress']}:{d['LocalPort']}  ({names.get(d['OwningProcess'], '?')}, PID {d['OwningProcess']})"
+            for d in data] if data else []
+
+
 def audit_failed_logins():
-    code, out, _ = run(["lastb", "-n", "10", "-w"])
-    return out.splitlines() if code == 0 else ["(lastb недоступен или нет записей)"]
+    data = ps("Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625} -MaxEvents 10 -ErrorAction SilentlyContinue "
+              "| Select-Object @{n='T';e={$_.TimeCreated.ToString('s')}},"
+              "@{n='User';e={$_.Properties[5].Value}},@{n='IP';e={$_.Properties[19].Value}}", as_json=True)
+    return [f"{d['T']}  пользователь={d['User']}  ip={d['IP']}" for d in data] if data else ["(нет событий)"]
+
+
+def audit_startup():
+    data = ps("Get-CimInstance Win32_StartupCommand | Select-Object Name,Command,User", as_json=True)
+    return [f"{d['Name']} -> {d['Command']} ({d['User']})" for d in data] if data else []
 
 
 def audit_updates():
-    if shutil.which("apt"):
-        _, out, _ = run(["apt", "list", "--upgradable"], timeout=120)
-        return [l for l in out.splitlines() if "/" in l][:30]
-    if shutil.which("dnf"):
-        _, out, _ = run(["dnf", "-q", "check-update"], timeout=180)
-        return out.splitlines()[:30]
-    return []
+    data = ps("Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 5 "
+              "HotFixID,@{n='D';e={if($_.InstalledOn){$_.InstalledOn.ToString('yyyy-MM-dd')}}}",
+              as_json=True)
+    return [f"{d['HotFixID']} ({d['D']})" for d in data] if data else ["(нет данных)"]
 
 
 def run_audit():
     return {
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-        "hostname": os.uname().nodename,
-        "kernel": os.uname().release,
-        "uid0_extra_accounts": audit_uid0(),
-        "admin_groups": audit_admin_groups(),
-        "sudoers_nopasswd": audit_sudoers(),
-        "empty_passwords": audit_empty_passwords(),
-        "login_shell_users": audit_login_shell_users(),
-        "suid_files": audit_suid(),
-        "world_writable_system_files": audit_world_writable(),
+        "hostname": platform.node(),
+        "os": f"{platform.system()} {platform.release()} ({platform.version()})",
+        "administrators": audit_admins(),
+        "local_users": audit_users(),
+        "password_policy": audit_password_policy(),
+        "firewall": audit_firewall(),
+        "defender": audit_defender(),
+        "uac": audit_uac(),
+        "rdp": audit_rdp(),
+        "smb1": audit_smb1(),
+        "bitlocker": audit_bitlocker(),
         "listening_ports": audit_listening_ports(),
-        "ssh_config_issues": audit_ssh(),
-        "last_logins": audit_last_logins(),
-        "failed_logins": audit_failed_logins(),
-        "pending_updates": audit_updates(),
+        "failed_logins_last10": audit_failed_logins(),
+        "startup_programs": audit_startup(),
+        "latest_updates": audit_updates(),
     }
 
 
 def format_report(data):
     lines = [f"=== АУДИТ СИСТЕМЫ: {data['hostname']} ({data['timestamp']}) ===",
-             f"Ядро: {data['kernel']}", ""]
-    warn_keys = {"uid0_extra_accounts", "sudoers_nopasswd", "empty_passwords",
-                 "world_writable_system_files", "ssh_config_issues"}
+             f"ОС: {data['os']}", ""]
     for key, val in data.items():
-        if key in ("timestamp", "hostname", "kernel"):
+        if key in ("timestamp", "hostname", "os"):
             continue
-        flag = " [!]" if key in warn_keys and val else ""
-        lines.append(f"--- {key}{flag} ---")
-        if isinstance(val, dict):
-            for k, v in val.items():
-                lines.append(f"  {k}: {', '.join(v) if v else '(пусто)'}")
-        elif val:
-            lines += [f"  {item}" for item in val]
-        else:
-            lines.append("  (ничего не найдено)")
+        lines.append(f"--- {key} ---")
+        lines += [f"  {i}" for i in val] if val else ["  (ничего не найдено)"]
         lines.append("")
     return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
 def main():
-    parser = argparse.ArgumentParser(description="Выдача админ-прав и аудит системы (Linux)")
+    parser = argparse.ArgumentParser(description="Выдача админ-прав и аудит системы (Windows)")
     sub = parser.add_subparsers(dest="cmd", required=True)
-
-    g = sub.add_parser("grant", help="выдать админ-права пользователю")
-    g.add_argument("user")
-    g.add_argument("--nopasswd", action="store_true", help="sudo без пароля (небезопасно)")
-
-    r = sub.add_parser("revoke", help="отозвать админ-права")
-    r.add_argument("user")
-
+    sub.add_parser("grant", help="выдать права администратора").add_argument("user")
+    sub.add_parser("revoke", help="отозвать права администратора").add_argument("user")
     a = sub.add_parser("audit", help="аудит системы")
-    a.add_argument("--json", action="store_true", help="вывод в JSON")
+    a.add_argument("--json", action="store_true")
     a.add_argument("--output", help="сохранить отчёт в файл")
-
     args = parser.parse_args()
-    require_root()
+
+    require_admin()
     setup_logging()
 
     if args.cmd == "grant":
-        grant(args.user, args.nopasswd)
+        grant(args.user)
     elif args.cmd == "revoke":
         revoke(args.user)
-    elif args.cmd == "audit":
+    else:
         data = run_audit()
         text = json.dumps(data, ensure_ascii=False, indent=2) if args.json else format_report(data)
         if args.output:
-            with open(args.output, "w") as fh:
+            with open(args.output, "w", encoding="utf-8") as fh:
                 fh.write(text)
-            os.chmod(args.output, 0o600)
             logging.info("Отчёт сохранён: %s", args.output)
         else:
             print(text)
